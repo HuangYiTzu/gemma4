@@ -2,27 +2,57 @@
 ** HOST code for the Gemma-4-E2B MLP accelerator (Alveo U280, Vitis / OpenCL)
 **
 **   o) detects the Xilinx platform / target device, loads the xclbin
-**   o) repacks the INT2 QAT weights into the 32 HBM pseudo-channel images
-**      (mlp_model.h -- the same offline layout the C testbench uses):
+**   o) loads the real INT2 QAT weights and scales of layer 15 from the
+**      bin_packing_mlp.py export (mlp_bin_output/layer_15; format at the top
+**      of mlp_model.h).  The export already has the HBM layout:
 **        - W_gate / W_up : fused column zip, ^0xAA, 512-column macro tiles,
 **                          SLR(t) = t/16, 16 columns per pseudo-channel
 **        - W_down        : K split, SLR(n_tile,k_tile) = k_tile/8,
 **                          4 rows per pseudo-channel
+**      so gate_up_weight_pcNN.bin ++ down_weight_slr{0,1,2}_pcNN.bin is
+**      channel image NN as is.
+**   o) derives the per-channel requant multipliers r_g / r_u / c_down from
+**      the checkpoint's weight and activation scales
 **   o) pins every channel image to its own HBM bank (XCL_MEM_TOPOLOGY), which
-**      is what lets the SLR0 data mover own all 32 AXI ports locally
-**   o) runs the "mlp" kernel and checks the 1536-wide Q7.8 output against the
-**      golden model (exact integer GEMV / requant / GELU-LUT path)
+**      is what lets the SLR0 data movers own all 32 AXI ports locally
+**   o) runs the accelerator and checks the 1536-wide INT16 down_proj codes
+**      bit-exactly against the golden model (the datapath is all integer)
+**
+** The accelerator is NINE compute units (mlp_link.cfg):
+**     ctrl_1     (mlp_ctrl,    SLR0)      x_q / r_g / r_u -> 3 control lanes
+**     mover_1..4 (mlp_mover,   SLR0)      8 HBM ports each; CU j owns
+**                                         HBM[8j..8j+7] and engine lane j
+**     eng_1/2/3  (mlp_engine,  SLR0/1/2)  one MAC array per SLR, FREE-RUNNING
+**     collect_1  (mlp_collect, SLR0)      c_down + y_q
+** Only the six SLR0 kernels have arguments and are enqueued here; the engines
+** have stream ports only (ap_ctrl_none) and are started by the data that the
+** control kernel and the movers push, so the host never touches them.
+**
+** WHY FOUR MOVERS.  One 32-port mover made every SLR-crossing net start from
+** the same block, and SLLs are allocated per column: route_design measured
+** 207 % demand on one column against 14 % on another and refused the design
+** (VPL 35-3, global congestion level 7) although the boundary total was only
+** 83 %.  Four CUs anchored to four contiguous HBM blocks start their crossings
+** from four points across the die width.  See kernel.h for the full argument.
+** Nothing about the DATA changed -- the weight files and their HBM banks are
+** exactly as before, only which CU reads which bank.
+**
+** The four movers are four CUs of ONE kernel, so they are selected by CU name:
+**     clCreateKernel(program, "mlp_mover:{mlp_mover_1}", ...)
 **
 ** The v++ link must place the ports on matching banks, e.g.
 **     [connectivity]
-**     sp=mlp_1.w_hbm_0:HBM[0]
-**     ...
-**     sp=mlp_1.w_hbm_31:HBM[31]
-**     sp=mlp_1.x_q:HBM[0]      (and the rest of the gmemS bundle)
-**     slr=mlp_1:SLR0
-**
-** The real QAT export is not available yet, so all weights and scales are
-** chosen placeholder values and only functional correctness is checked.
+**     sp=mlp_mover_1.w_hbm_0:HBM[0]  ... sp=mlp_mover_1.w_hbm_7:HBM[7]
+**     sp=mlp_mover_2.w_hbm_0:HBM[8]  ... and so on to mlp_mover_4 / HBM[31]
+**     sp=mlp_ctrl_1.x_q:PLRAM[0]      (x_q / r_g / r_u = gmemS bundle)
+**     sp=mlp_collect_1.c_down:PLRAM[1] (c_down / y_q    = gmemC bundle)
+**                                 NOT on HBM -- hmss_0 has only 33 slots;
+**                                 NOT on DDR[0] -- that instantiates a whole
+**                                 DDR4 controller in the busiest SLR
+**     slr=mlp_engine_2:SLR1
+** The control-plane buffers below are created WITHOUT a bank flag on
+** purpose: XRT allocates each one in whatever bank its kernel argument is
+** connected to, so moving them between DDR / PLRAM is a link-only change.
 **
 ** Based on the Xilinx 2018 OpenCL host template.
 *******************************************************************************/
@@ -58,16 +88,26 @@ using namespace std;
 #endif
 
 // ---------------------------------------------------------------------------
-// Pass/fail thresholds on the Q7.8 output.  The bit-accurate C simulation
-// measured MAE = 0.257 LSB and max |err| = 0.501 LSB (the output rounding
-// floor); the thresholds below keep a 2x / 4x margin.
+// Pass/fail: the kernel output is an INT16 code and every stage from x_q to
+// y_q is integer arithmetic, so the golden model predicts it EXACTLY.  Any
+// nonzero difference is a real error (layout, DSP split, transfer, ...).
 // ---------------------------------------------------------------------------
-static const double LSB         = 1.0 / MLP_HID_SCALE;
-static const double MAX_ABS_TOL = 4.0 * LSB;
-static const double MAE_TOL     = 1.0 * LSB;
 
-// number of kernel arguments: 32 HBM channels + 7 control-plane vectors
-#define MLP_NB_ARGS (MLP_NPC + 7)
+// kernel arguments: a mover CU takes its MLP_NPC_MV HBM channels, the control
+// kernel takes x_q / r_g / r_u and the collector c_down / y_q.  The three
+// engines have none (stream ports only, ap_ctrl_none).
+#define MLP_NB_ARGS_MOVER   MLP_NPC_MV
+#define MLP_NB_ARGS_CTRL    3
+#define MLP_NB_ARGS_COLLECT 2
+
+// enqueued kernels per test case: the collector, the control kernel and the
+// MLP_NMV movers.  Their events sit at K_exe_event[c * MLP_KPC + ...] in the
+// order below; the result read-back only has to wait on the collector, which
+// is the one that writes y_q.
+#define MLP_KPC             (2 + MLP_NMV)
+#define MLP_KEV_COLLECT(c)  ((c) * MLP_KPC + 0)
+#define MLP_KEV_CTRL(c)     ((c) * MLP_KPC + 1)
+#define MLP_KEV_MOVER(c, j) ((c) * MLP_KPC + 2 + (j))
 
 static void *aligned_alloc_or_die(size_t bytes, const char *what)
 {
@@ -99,10 +139,10 @@ int main(int argc, char* argv[])
 	cout << "HOST-Info: ============================================================= " << endl;
 	#endif
 
-	if (argc != 4 && argc != 5)
+	if (argc < 4 || argc > 6)
 	{
 		cout << "HOST-Error: Incorrect command line syntax " << endl;
-		cout << "HOST-Info:  Usage: " << argv[0] << " <Platform_Vendor> <Device_Name> <XCLBIN_File> [Nb_Of_Test_Cases]" << endl << endl;
+		cout << "HOST-Info:  Usage: " << argv[0] << " <Platform_Vendor> <Device_Name> <XCLBIN_File> [Nb_Of_Test_Cases] [Layer_Dir]" << endl << endl;
 		return EXIT_FAILURE;
 	}
 
@@ -110,21 +150,26 @@ int main(int argc, char* argv[])
 	const char* Target_Device_Name       = argv[2];
 	const char* xclbinFilename           = argv[3];
 
-	// One test case = one draw of the six runtime vectors (mlp_model.h,
-	// MLP_TC_*).  The weights are NOT part of a case: they stay resident in
-	// HBM, exactly as at decode time where only the activation changes per
-	// token.  sw_emu is slow, so the count is settable from the command line.
-	const int NB_CASES = (argc == 5) ? atoi(argv[4]) : MLP_NB_TESTS;
+	// One test case = one activation vector x_q (mlp_model.h, MLP_TC_*).
+	// The weights and scales are NOT part of a case: they come from the
+	// checkpoint and stay resident in HBM, exactly as at decode time where
+	// only the activation changes per token.  sw_emu is slow, so the count is
+	// settable from the command line.
+	const int NB_CASES = (argc >= 5) ? atoi(argv[4]) : MLP_NB_TESTS;
 	if (NB_CASES < 1) {
 		cout << "HOST-Error: Nb_Of_Test_Cases must be >= 1" << endl << endl;
 		return EXIT_FAILURE;
 	}
+	char layer_dirbuf[1024];
+	const char *layer_dir = (argc == 6) ? argv[5]
+	                      : mlp_find_layer_dir(layer_dirbuf, sizeof layer_dirbuf);
 
 	cout << "HOST-Info: Platform_Vendor   : " << Target_Platform_Vendor << endl;
 	cout << "HOST-Info: Device_Name       : " << Target_Device_Name << endl;
 	cout << "HOST-Info: XCLBIN_file       : " << xclbinFilename << endl;
-	cout << "HOST-Info: Model             : Gemma-4-E2B MLP, K=" << MLP_K
-	     << " F=" << MLP_F << ", INT2 weights, decode stage" << endl;
+	cout << "HOST-Info: Model             : Gemma-4-E2B MLP layer " << MLP_LAYER_IDX
+	     << ", K=" << MLP_K << " F=" << MLP_F << ", INT2 weights, decode stage" << endl;
+	cout << "HOST-Info: Layer export      : " << layer_dir << endl;
 	cout << "HOST-Info: Test cases        : " << NB_CASES
 	     << " (weights loaded once, activations refreshed per case)" << endl;
 
@@ -352,14 +397,36 @@ int main(int argc, char* argv[])
 		return EXIT_FAILURE;
 	}
 
-	cl_kernel K_mlp;
+	cl_kernel K_ctrl, K_mover[MLP_NMV], K_collect;
 
 	#ifdef ALL_MESSAGES
-	cout << "HOST-Info: Creating a Kernel: mlp ..." << endl;
+	cout << "HOST-Info: Creating the Kernels: mlp_ctrl, mlp_mover x" << MLP_NMV
+	     << ", mlp_collect ..." << endl;
+	cout << "HOST-Info:   (mlp_engine x3 are free-running: no arguments, never enqueued)" << endl;
 	#endif
-	K_mlp = clCreateKernel(Program, "mlp", &errCode);
+	K_ctrl = clCreateKernel(Program, "mlp_ctrl", &errCode);
 	if (errCode != CL_SUCCESS) {
-		cout << endl << "HOST-Error: Failed to create K_mlp" << endl << endl;
+		cout << endl << "HOST-Error: Failed to create K_ctrl" << endl << endl;
+		return EXIT_FAILURE;
+	}
+
+	// The MLP_NMV movers are compute units of ONE kernel, so each has to be
+	// requested by CU name -- "mlp_mover" alone would bind to whichever CU XRT
+	// picks and the other three would never start.  CU j reads HBM[8j..8j+7]
+	// (mlp_link.cfg), which is what fixes the host-side argument split below.
+	for (int j = 0; j < MLP_NMV; ++j) {
+		char kname[64];
+		snprintf(kname, sizeof kname, "mlp_mover:{mlp_mover_%d}", j + 1);
+		K_mover[j] = clCreateKernel(Program, kname, &errCode);
+		if (errCode != CL_SUCCESS) {
+			cout << endl << "HOST-Error: Failed to create " << kname << endl << endl;
+			return EXIT_FAILURE;
+		}
+	}
+
+	K_collect = clCreateKernel(Program, "mlp_collect", &errCode);
+	if (errCode != CL_SUCCESS) {
+		cout << endl << "HOST-Error: Failed to create K_collect" << endl << endl;
 		return EXIT_FAILURE;
 	}
 
@@ -380,43 +447,48 @@ int main(int argc, char* argv[])
 	for (int p = 0; p < MLP_NPC; ++p)
 		ch_img[p] = (unsigned char *)aligned_alloc_or_die(MLP_CH_BYTES, "HBM channel image");
 
+	// x_q / r_g / r_u stay plain INT32 arrays here, but the kernel reads them
+	// as 512-bit words (kernel.h): one word = 16 contiguous INT32, which is
+	// exactly what a little-endian AXI master sees.  That needs the buffers
+	// 64 B aligned and a whole number of words long -- posix_memalign(4096)
+	// covers the first, and 1536 / 12288 INT32 are 96 / 768 words exactly.
 	int *x_q      = (int *)aligned_alloc_or_die(MLP_K        * sizeof(int), "x_q");
 	int *r_g      = (int *)aligned_alloc_or_die(MLP_F        * sizeof(int), "r_g");
 	int *r_u      = (int *)aligned_alloc_or_die(MLP_F        * sizeof(int), "r_u");
 	int *c_down   = (int *)aligned_alloc_or_die(MLP_N_DOWN   * sizeof(int), "c_down");
-	int *ln_gamma = (int *)aligned_alloc_or_die(MLP_N_DOWN   * sizeof(int), "ln_gamma");
-	int *resid    = (int *)aligned_alloc_or_die(MLP_N_DOWN   * sizeof(int), "resid");
 	int *RES      = (int *)aligned_alloc_or_die(MLP_N_DOWN   * sizeof(int), "RES");
 	memset(RES, 0, MLP_N_DOWN * sizeof(int));
 
 	// per-case golden outputs, hardware outputs and coverage counters.  The
 	// golden model is run for EVERY case up front so that no host-side compute
 	// sits between two kernel launches and pollutes the profiling window.
-	double    **gold_y = new double *[NB_CASES];
-	int       **hw_y   = new int    *[NB_CASES];
+	int       **gold_y = new int    *[NB_CASES];   // golden INT16 codes
+	int       **hw_y   = new int    *[NB_CASES];   // kernel INT16 codes
+	double    **ref_y  = new double *[NB_CASES];   // real p * ws_down * S_H
 	mlp_cov_t  *cov    = new mlp_cov_t[NB_CASES];
 	for (int c = 0; c < NB_CASES; ++c) {
-		gold_y[c] = new double[MLP_N_DOWN];
+		gold_y[c] = new int[MLP_N_DOWN];
 		hw_y[c]   = new int[MLP_N_DOWN];
+		ref_y[c]  = new double[MLP_N_DOWN];
 	}
 
-	cout << "HOST-Info: Generating placeholder weights / scales ... ";
-	mlp_gen_stimulus(x_q, r_g, r_u, c_down, ln_gamma, resid, MLP_TC_BASELINE);
-	cout << "done" << endl;
-
-	// mlp_repack_* fill one contiguous [32][MLP_CH_BYTES] block, so the images
-	// are repacked into a staging buffer and then split across the 32
+	// mlp_load_layer fills one contiguous [32][MLP_CH_BYTES] block (the weight
+	// files are the channel images), which is then split across the 32
 	// page-aligned per-channel allocations that back the HBM buffers.
-	cout << "HOST-Info: Repacking INT2 weights into " << MLP_NPC
-	     << " HBM channel images (" << MLP_NPC * (long)MLP_CH_BYTES / (1024 * 1024)
-	     << " MB) ... ";
+	static mlp_layer_t layer;
+	cout << "HOST-Info: Loading layer " << MLP_LAYER_IDX << " weights / scales into "
+	     << MLP_NPC << " HBM channel images ("
+	     << MLP_NPC * (long)MLP_CH_BYTES / (1024 * 1024) << " MB) ... ";
 	cout.flush();
 	{
 		static mlp_img_t staging;
-		mlp_repack_gate_up(staging);
-		mlp_repack_down(staging);
+		if (mlp_load_layer(layer_dir, staging, &layer)) {
+			cout << endl << "HOST-Error: cannot load the layer export from "
+			     << layer_dir << endl;
+			return EXIT_FAILURE;
+		}
 		cout << "done" << endl;
-		if (mlp_check_packing(staging)) {
+		if (mlp_check_packing(staging, &layer)) {
 			cout << "HOST-Error: HBM packing contract self-check FAILED" << endl;
 			return EXIT_FAILURE;
 		}
@@ -425,10 +497,21 @@ int main(int argc, char* argv[])
 			memcpy(ch_img[p], staging[p], MLP_CH_BYTES);
 	}
 
+	// requant multipliers: from the checkpoint scales, once per layer
+	if (mlp_layer_requant(&layer, r_g, r_u, c_down)) {
+		cout << "HOST-Error: a requant multiplier does not fit INT32" << endl;
+		return EXIT_FAILURE;
+	}
+	cout << "HOST-Info: S_IN " << MLP_S_IN << "  S_G " << MLP_S_G << "  S_U " << MLP_S_U
+	     << "  S_H " << MLP_S_H << "  S_Y " << MLP_S_Y
+	     << "  (G' Q" << 16 - MLP_GLUT_FRAC << "." << MLP_GLUT_FRAC << ")" << endl;
+
 	// ------------------------------------------------------------------
 	// Step 4.2: Create Buffers in Global Memory
-	//   every weight image is pinned to its own HBM pseudo-channel so that
-	//   the SLR0 data mover reaches all 32 AXI ports locally (zero SLL)
+	//   Every weight image is pinned to its own HBM pseudo-channel so that the
+	//   SLR0 data movers reach all 32 AXI ports locally (zero SLL).  The bank
+	//   assignment is unchanged by the four-mover split -- image p still lives
+	//   in HBM[p]; all that changed is which of the four CUs reads it.
 	// ------------------------------------------------------------------
 	#ifdef ALL_MESSAGES
 	cout << "HOST-Info: Allocating buffers in Global Memory ..." << endl;
@@ -455,8 +538,6 @@ int main(int argc, char* argv[])
 	cl_mem GlobMem_rg  = clCreateBuffer(Context, CL_MEM_READ_ONLY  | CL_MEM_USE_HOST_PTR, MLP_F      * sizeof(int), r_g,      &errCode);
 	cl_mem GlobMem_ru  = clCreateBuffer(Context, CL_MEM_READ_ONLY  | CL_MEM_USE_HOST_PTR, MLP_F      * sizeof(int), r_u,      &errCode);
 	cl_mem GlobMem_cd  = clCreateBuffer(Context, CL_MEM_READ_ONLY  | CL_MEM_USE_HOST_PTR, MLP_N_DOWN * sizeof(int), c_down,   &errCode);
-	cl_mem GlobMem_ln  = clCreateBuffer(Context, CL_MEM_READ_ONLY  | CL_MEM_USE_HOST_PTR, MLP_N_DOWN * sizeof(int), ln_gamma, &errCode);
-	cl_mem GlobMem_rs  = clCreateBuffer(Context, CL_MEM_READ_ONLY  | CL_MEM_USE_HOST_PTR, MLP_N_DOWN * sizeof(int), resid,    &errCode);
 	cl_mem GlobMem_RES = clCreateBuffer(Context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR, MLP_N_DOWN * sizeof(int), RES,      &errCode);
 	if (errCode != CL_SUCCESS) {
 		cout << endl << "Host-Error: Failed to allocate the control-plane buffers" << endl << endl;
@@ -465,11 +546,13 @@ int main(int argc, char* argv[])
 
 	// ============================================================================
 	// Step 5: Set Kernel Arguments and Run the Application
-	//         args 0..31 : w_hbm_0 .. w_hbm_31
-	//         args 32..38: x_q, r_g, r_u, c_down, ln_gamma, resid, y_out
+	//         mover j args 0..7 : w_hbm_0 .. w_hbm_7  = HBM[8j .. 8j+7]
+	//         ctrl    args 0..2 : x_q, r_g, r_u
+	//         collect args 0..1 : c_down, y_q
 	// ============================================================================
-	// events: one weight upload + (input, output) per case; one kernel per case
-	const int Nb_Of_Mem_Events = 1 + 2 * NB_CASES, Nb_Of_Exe_Events = NB_CASES;
+	// events: one weight upload + (input, output) per case; MLP_KPC kernels per case
+	const int Nb_Of_Mem_Events = 1 + 2 * NB_CASES;
+	const int Nb_Of_Exe_Events = MLP_KPC * NB_CASES;
 	cl_event *Mem_op_event = new cl_event[Nb_Of_Mem_Events];
 	cl_event *K_exe_event  = new cl_event[Nb_Of_Exe_Events];
 
@@ -478,19 +561,33 @@ int main(int argc, char* argv[])
 	cout << "HOST-Info: ============================================================= " << endl;
 	cout << "HOST-Info: (Step 5) Run Application                                      " << endl;
 	cout << "HOST-Info: ============================================================= " << endl;
-	cout << "HOST-Info: Setting Kernel arguments (" << MLP_NB_ARGS << ") ..." << endl;
+	cout << "HOST-Info: Setting Kernel arguments (mover " << MLP_NB_ARGS_MOVER
+	     << " x" << MLP_NMV << ", ctrl " << MLP_NB_ARGS_CTRL
+	     << ", collect " << MLP_NB_ARGS_COLLECT << ") ..." << endl;
 	#endif
 
 	errCode = CL_SUCCESS;
-	for (int p = 0; p < MLP_NPC; ++p)
-		errCode |= clSetKernelArg(K_mlp, p, sizeof(cl_mem), &GlobMem_W[p]);
-	errCode |= clSetKernelArg(K_mlp, MLP_NPC + 0, sizeof(cl_mem), &GlobMem_x);
-	errCode |= clSetKernelArg(K_mlp, MLP_NPC + 1, sizeof(cl_mem), &GlobMem_rg);
-	errCode |= clSetKernelArg(K_mlp, MLP_NPC + 2, sizeof(cl_mem), &GlobMem_ru);
-	errCode |= clSetKernelArg(K_mlp, MLP_NPC + 3, sizeof(cl_mem), &GlobMem_cd);
-	errCode |= clSetKernelArg(K_mlp, MLP_NPC + 4, sizeof(cl_mem), &GlobMem_ln);
-	errCode |= clSetKernelArg(K_mlp, MLP_NPC + 5, sizeof(cl_mem), &GlobMem_rs);
-	errCode |= clSetKernelArg(K_mlp, MLP_NPC + 6, sizeof(cl_mem), &GlobMem_RES);
+
+	// Mover CU j gets the MLP_NPC_MV channel images its sp= lines bind it to.
+	// The kernel numbers its ports 0..MLP_NPC_MV-1 whatever CU it is, so the
+	// host has to apply the same j * MLP_NPC_MV offset the link does -- a
+	// mismatch here would feed an engine another block's weights and fail the
+	// bit-exact check rather than crash.
+	for (int j = 0; j < MLP_NMV; ++j)
+		for (int p = 0; p < MLP_NPC_MV; ++p)
+			errCode |= clSetKernelArg(K_mover[j], p, sizeof(cl_mem),
+			                          &GlobMem_W[j * MLP_NPC_MV + p]);
+
+	// NOTE: AXI4-Stream ports consume kernel argument indices too and must be
+	// left unset ("Invalid stream_argument value for kernel arg" otherwise), so
+	// every kernel declares its pointers BEFORE its stream ports and only the
+	// indices below exist for the host.
+	errCode |= clSetKernelArg(K_ctrl, 0, sizeof(cl_mem), &GlobMem_x);
+	errCode |= clSetKernelArg(K_ctrl, 1, sizeof(cl_mem), &GlobMem_rg);
+	errCode |= clSetKernelArg(K_ctrl, 2, sizeof(cl_mem), &GlobMem_ru);
+
+	errCode |= clSetKernelArg(K_collect, 0, sizeof(cl_mem), &GlobMem_cd);
+	errCode |= clSetKernelArg(K_collect, 1, sizeof(cl_mem), &GlobMem_RES);
 
 	if (errCode != CL_SUCCESS) {
 		cout << endl << "Host-ERROR: Failed to set Kernel arguments" << endl << endl;
@@ -509,23 +606,27 @@ int main(int argc, char* argv[])
 		static int       g_h [MLP_F];
 		static long long g_ps[MLP_N_DOWN];
 		for (int c = 0; c < NB_CASES; ++c) {
-			mlp_gen_stimulus(x_q, r_g, r_u, c_down, ln_gamma, resid, c);
-			mlp_golden(x_q, r_g, r_u, c_down, ln_gamma, resid,
+			mlp_gen_x(&layer, x_q, c);
+			mlp_golden(&layer, x_q, r_g, r_u, c_down,
 			           g_h, g_ps, gold_y[c], &cov[c]);
+			for (int j = 0; j < MLP_N_DOWN; ++j)
+				ref_y[c][j] = (double)g_ps[j] * layer.ws_down[j] * MLP_S_H;
 			cout << "HOST-Info:   case " << setw(3) << c << "  "
 			     << left << setw(10) << mlp_case_name(c) << right
-			     << "  mean-sq " << scientific << setprecision(3) << cov[c].ms
-			     << "  rsqrt " << cov[c].rs
-			     << "  clamps " << fixed << cov[c].qg_sat << "/" << cov[c].qu_sat
+			     << "  y_q [" << cov[c].y_min << ", " << cov[c].y_max << "]"
+			     << "  int16 sat " << cov[c].ysat_pos + cov[c].ysat_neg
+			     << "  clamps " << cov[c].qg_sat << "/" << cov[c].qu_sat
 			     << "/" << cov[c].h_sat
-			     << "  LUT " << cov[c].lut_hits << "/256" << endl;
+			     << "  LUT " << cov[c].lut_hits << "/256"
+			     << "  fq_h_mis " << cov[c].fq_h_mis << endl;
 		}
 	}
 
 	// ------------------------------------------------------------------
 	// Step 5.3: Upload the weights ONCE
 	//   14.16 MB of INT2 weights are resident in HBM for the whole run;
-	//   only the 6 narrow runtime vectors are refreshed per case.  This is
+	//   only the activation vector is refreshed per case (r_g / r_u / c_down
+	//   belong to the layer and are uploaded with it).  This is
 	//   also what makes the per-case kernel time a meaningful per-token
 	//   number instead of one dominated by a weight reload.
 	// ------------------------------------------------------------------
@@ -546,21 +647,20 @@ int main(int argc, char* argv[])
 	// ------------------------------------------------------------------
 	// Step 5.4: One kernel launch per test case
 	// ------------------------------------------------------------------
-	cl_mem In_Buffers[6];
+	cl_mem In_Buffers[4];
 	In_Buffers[0] = GlobMem_x;
 	In_Buffers[1] = GlobMem_rg;
 	In_Buffers[2] = GlobMem_ru;
 	In_Buffers[3] = GlobMem_cd;
-	In_Buffers[4] = GlobMem_ln;
-	In_Buffers[5] = GlobMem_rs;
 
 	for (int c = 0; c < NB_CASES; ++c) {
-		// refresh the activation / scale vectors in place: the cl_mem
-		// objects are CL_MEM_USE_HOST_PTR views of exactly these arrays
-		mlp_gen_stimulus(x_q, r_g, r_u, c_down, ln_gamma, resid, c);
+		// refresh the activation vector in place: the cl_mem objects are
+		// CL_MEM_USE_HOST_PTR views of exactly these arrays (the requant
+		// vectors are re-migrated unchanged, they are tiny)
+		mlp_gen_x(&layer, x_q, c);
 		memset(RES, 0, MLP_N_DOWN * sizeof(int));
 
-		errCode = clEnqueueMigrateMemObjects(Command_Queue, 6, In_Buffers, 0, 0, NULL,
+		errCode = clEnqueueMigrateMemObjects(Command_Queue, 4, In_Buffers, 0, 0, NULL,
 		                                     &Mem_op_event[1 + 2 * c]);
 		if (errCode != CL_SUCCESS) {
 			cout << endl << "Host-Error: Failed to write the input vectors (case " << c << ")" << endl << endl;
@@ -573,17 +673,51 @@ int main(int argc, char* argv[])
 			return EXIT_FAILURE;
 		}
 
-		cout << "HOST-Info: Submitting Kernel mlp, case " << c
+		cout << "HOST-Info: Submitting Kernels mlp_collect + mlp_mover x" << MLP_NMV
+		     << " + mlp_ctrl, case " << c
 		     << " (" << mlp_case_name(c) << ") ..." << endl;
 
-		errCode = clEnqueueTask(Command_Queue, K_mlp, 0, NULL, &K_exe_event[c]);
+		// The collector is enqueued FIRST and simply blocks on its three
+		// partial-sum streams; the movers and the control kernel then start
+		// the token.  The queue is out of order, so all six run concurrently
+		// -- which they must, the collector drains the engines while the
+		// movers are still feeding them.
+		errCode = clEnqueueTask(Command_Queue, K_collect, 0, NULL,
+		                        &K_exe_event[MLP_KEV_COLLECT(c)]);
 		if (errCode != CL_SUCCESS) {
-			cout << endl << "HOST-Error: Failed to submit K_mlp (case " << c << ")" << endl << endl;
+			cout << endl << "HOST-Error: Failed to submit K_collect (case " << c << ")" << endl << endl;
 			return EXIT_FAILURE;
 		}
 
+		// The movers go in before the control kernel on purpose.  An engine
+		// reads its whole control block BEFORE it touches a weight lane, so
+		// the movers simply fill their 512-deep lane FIFOs and back off until
+		// mlp_ctrl has run; starting them early just hides their launch
+		// latency.  There is no deadlock either way -- the control lanes come
+		// from a different CU, so a full weight FIFO cannot block them.
+		for (int j = 0; j < MLP_NMV; ++j) {
+			errCode = clEnqueueTask(Command_Queue, K_mover[j], 0, NULL,
+			                        &K_exe_event[MLP_KEV_MOVER(c, j)]);
+			if (errCode != CL_SUCCESS) {
+				cout << endl << "HOST-Error: Failed to submit K_mover[" << j
+				     << "] (case " << c << ")" << endl << endl;
+				return EXIT_FAILURE;
+			}
+		}
+
+		errCode = clEnqueueTask(Command_Queue, K_ctrl, 0, NULL,
+		                        &K_exe_event[MLP_KEV_CTRL(c)]);
+		if (errCode != CL_SUCCESS) {
+			cout << endl << "HOST-Error: Failed to submit K_ctrl (case " << c << ")" << endl << endl;
+			return EXIT_FAILURE;
+		}
+
+		// y_q is written by the collector alone, so that is the only event the
+		// read-back has to wait on.  The clFinish below still fences the
+		// movers before the next case rewrites the input buffers.
 		errCode = clEnqueueMigrateMemObjects(Command_Queue, 1, &GlobMem_RES, CL_MIGRATE_MEM_OBJECT_HOST,
-		                                     1, &K_exe_event[c], &Mem_op_event[2 + 2 * c]);
+		                                     1, &K_exe_event[MLP_KEV_COLLECT(c)],
+		                                     &Mem_op_event[2 + 2 * c]);
 		if (errCode != CL_SUCCESS) {
 			cout << endl << "Host-Error: Failed to submit Copy Results (case " << c << ")" << endl << endl;
 			return EXIT_FAILURE;
@@ -620,17 +754,16 @@ int main(int argc, char* argv[])
 
 	for (int c = 0; c < NB_CASES; c++) {
 		RES_File << "# case " << c << "  " << mlp_case_name(c)
-		         << "  mean_sq=" << scientific << setprecision(6) << cov[c].ms
-		         << "  rsqrt=" << cov[c].rs << fixed << endl;
-		RES_File << "#     j        hw_out         golden          error" << endl;
+		         << "  S_Y16=" << scientific << setprecision(6) << MLP_S_Y16
+		         << fixed << endl;
+		RES_File << "#     j   hw_code gold_code   hw_code*S_Y16   p*ws_down*S_H" << endl;
 		for (int j = 0; j < MLP_N_DOWN; j++) {
-			double hw   = (double)hw_y[c][j] / (double)MLP_HID_SCALE;
-			double gold = mlp_sat_q78(gold_y[c][j]);
 			RES_File << setw(7) << j
-			         << setw(15) << fixed << setprecision(6) << hw
-			         << setw(15) << gold
-			         << setw(15) << scientific << setprecision(3) << (hw - gold)
-			         << fixed << endl;
+			         << setw(10) << hw_y[c][j]
+			         << setw(10) << gold_y[c][j]
+			         << setw(16) << fixed << setprecision(6) << hw_y[c][j] * MLP_S_Y16
+			         << setw(16) << ref_y[c][j]
+			         << endl;
 		}
 		RES_File << endl;
 	}
@@ -642,69 +775,51 @@ int main(int argc, char* argv[])
 	bool   error_detected = false;
 	int    Max_Number_Of_Failures = 5;
 	int    nb_failed_cases = 0;
-	double worst_mae = 0.0, worst_max = 0.0;
-	int    worst_mae_c = 0, worst_max_c = 0;
 
 	cout << endl << "Host-Info: =============================================================" << endl;
-	cout <<         "Host-Info: Verifying the MLP output vs. the golden model"                 << endl;
-	cout <<         "Host-Info:   exact integer GEMV / requant / GELU-LUT path,"               << endl;
-	cout <<         "Host-Info:   double-precision dequant + post_feedforward_layernorm"       << endl;
-	cout <<         "Host-Info:   tolerance: max|err| <= " << scientific << setprecision(3) << MAX_ABS_TOL
-	     <<         ", MAE <= " << MAE_TOL << fixed << endl;
-	cout <<         "Host-Info: " << MLP_N_DOWN << " outputs per case (Q7.8, 1 LSB = "
-	     << scientific << setprecision(3) << LSB << ")" << fixed << endl;
-	cout << "Host-Info: ---------------------------------------------------------------------------" << endl;
-	cout << "Host-Info: case  name          MAE      RMSE       max   worst_j   mean-sq    rsqrt  res" << endl;
-	cout << "Host-Info:                    (LSB)     (LSB)     (LSB)" << endl;
-	cout << "Host-Info: ---------------------------------------------------------------------------" << endl;
+	cout <<         "Host-Info: Verifying the down_proj INT16 codes vs. the golden model"      << endl;
+	cout <<         "Host-Info:   integer datapath end to end -> bit-exact match required"     << endl;
+	cout <<         "Host-Info:   semantic: |y_q - p*ws_down*S_H/S_Y16| <= 0.5 + |p|*2^-25"   << endl;
+	cout <<         "Host-Info: " << MLP_N_DOWN << " outputs per case (INT16, 1 LSB = S_Y16 = "
+	     << scientific << setprecision(3) << MLP_S_Y16 << ")" << fixed << endl;
+	cout << "Host-Info: ------------------------------------------------------------------------------" << endl;
+	cout << "Host-Info: case  name        mismatch  max|diff|   y_min   y_max   sat(+/-)  sem_err  res" << endl;
+	cout << "Host-Info:                              (codes)                               (LSB)" << endl;
+	cout << "Host-Info: ------------------------------------------------------------------------------" << endl;
 
 	for (int c = 0; c < NB_CASES; c++) {
-		double max_abs_err = 0.0, sum_abs_err = 0.0, sum_sq_err = 0.0;
-		int    worst_j = 0, nb_printed = 0;
-		bool   case_bad = false;
+		int nb_mismatch = 0, max_diff = 0, nb_printed = 0;
 
 		for (int j = 0; j < MLP_N_DOWN; j++) {
-			double hw   = (double)hw_y[c][j] / (double)MLP_HID_SCALE;
-			double gold = mlp_sat_q78(gold_y[c][j]);
-			double err  = fabs(hw - gold);
-
-			sum_abs_err += err;
-			sum_sq_err  += err * err;
-			if (err > max_abs_err) { max_abs_err = err; worst_j = j; }
-
-			if (err > MAX_ABS_TOL) {
-				case_bad = true;
+			const int diff = abs(hw_y[c][j] - gold_y[c][j]);
+			if (diff > max_diff) max_diff = diff;
+			if (diff != 0) {
+				++nb_mismatch;
 				if (nb_printed++ < Max_Number_Of_Failures)
 					cout << "Host-Info:   case " << c << " j=" << setw(5) << j
-					     << "  expected " << setw(12) << setprecision(6) << gold
-					     << "  actual " << setw(12) << hw << "   Error" << endl;
+					     << "  expected " << setw(6) << gold_y[c][j]
+					     << "  actual " << setw(6) << hw_y[c][j] << "   Error" << endl;
 			}
 		}
 
-		double mae  = sum_abs_err / MLP_N_DOWN;
-		double rmse = sqrt(sum_sq_err / MLP_N_DOWN);
-		if (mae > MAE_TOL) case_bad = true;
+		const bool sem_ok   = cov[c].sem_err <= cov[c].sem_bound;
+		const bool fq_ok    = cov[c].fq_h_mis <= MLP_F / 100 && cov[c].fq_h_maxd <= 8;
+		const bool case_bad = (nb_mismatch != 0) || !sem_ok || !fq_ok;
 
-		cout << "Host-Info: " << setw(4) << c << "  " << left << setw(11)
+		cout << "Host-Info: " << setw(4) << c << "  " << left << setw(10)
 		     << mlp_case_name(c) << right
-		     << setw(8) << fixed << setprecision(3) << mae / LSB
-		     << setw(10) << rmse / LSB
-		     << setw(10) << max_abs_err / LSB
-		     << setw(9)  << worst_j
-		     << setw(11) << scientific << setprecision(2) << cov[c].ms
-		     << setw(10) << cov[c].rs << fixed
+		     << setw(10) << nb_mismatch
+		     << setw(11) << max_diff
+		     << setw(8)  << cov[c].y_min
+		     << setw(8)  << cov[c].y_max
+		     << setw(6)  << cov[c].ysat_pos << "/" << left << setw(5) << cov[c].ysat_neg << right
+		     << setw(8)  << fixed << setprecision(3) << cov[c].sem_err
 		     << "  " << (case_bad ? "FAIL" : "pass") << endl;
 
 		if (case_bad) { error_detected = true; ++nb_failed_cases; }
-		if (mae / LSB > worst_mae)         { worst_mae = mae / LSB; worst_mae_c = c; }
-		if (max_abs_err / LSB > worst_max) { worst_max = max_abs_err / LSB; worst_max_c = c; }
 	}
 
-	cout << "Host-Info: ---------------------------------------------------------------------------" << endl;
-	cout << "Host-Info: worst MAE       : " << fixed << setprecision(3) << worst_mae
-	     << " LSB  (case " << worst_mae_c << " " << mlp_case_name(worst_mae_c) << ")" << endl;
-	cout << "Host-Info: worst max |err| : " << worst_max
-	     << " LSB  (case " << worst_max_c << " " << mlp_case_name(worst_max_c) << ")" << endl;
+	cout << "Host-Info: ------------------------------------------------------------------------------" << endl;
 	cout << "Host-Info: =============================================================" << endl;
 
 	if (error_detected == false) {
@@ -728,12 +843,20 @@ int main(int argc, char* argv[])
 	// Transfer_4,5      : case 1 ... and so on
 	cout << "HOST-Info: Transfer_1 is the one-off " << MLP_NPC * (long)MLP_CH_BYTES / (1024 * 1024)
 	     << " MB weight upload; Transfer_2k/2k+1 are case k-1 in/out." << endl;
-	cout << "HOST-Info: Per-token latency is K_mlp[c] alone -- the weight upload is"  << endl;
-	cout << "HOST-Info: amortized over every token and must NOT be counted per case." << endl;
+	cout << "HOST-Info: Per-token latency is the SLOWEST K_mv*_c[c] (they run"  << endl;
+	cout << "HOST-Info: concurrently and self-align through the lane FIFOs; the" << endl;
+	cout << "HOST-Info: collector and mlp_ctrl overlap them)" << endl;
+	cout << "HOST-Info: -- the weight upload is amortized over every token and must" << endl;
+	cout << "HOST-Info: NOT be counted per case." << endl;
 
 	string *list_of_kernel_names = new string[Nb_Of_Exe_Events];
-	for (int c = 0; c < NB_CASES; ++c)
-		list_of_kernel_names[c] = "K_mlp_c" + to_string(c);
+	for (int c = 0; c < NB_CASES; ++c) {
+		list_of_kernel_names[MLP_KEV_COLLECT(c)] = "K_collect_c" + to_string(c);
+		list_of_kernel_names[MLP_KEV_CTRL(c)]    = "K_ctrl_c"    + to_string(c);
+		for (int j = 0; j < MLP_NMV; ++j)
+			list_of_kernel_names[MLP_KEV_MOVER(c, j)] =
+				"K_mv" + to_string(j) + "_c" + to_string(c);
+	}
 	run_custom_profiling(Nb_Of_Kernels, Nb_Of_Memory_Tranfers, K_exe_event, Mem_op_event, list_of_kernel_names);
 	delete[] list_of_kernel_names;
 
@@ -750,11 +873,11 @@ int main(int argc, char* argv[])
 	clReleaseMemObject(GlobMem_rg);
 	clReleaseMemObject(GlobMem_ru);
 	clReleaseMemObject(GlobMem_cd);
-	clReleaseMemObject(GlobMem_ln);
-	clReleaseMemObject(GlobMem_rs);
 	clReleaseMemObject(GlobMem_RES);
 
-	clReleaseKernel(K_mlp);
+	clReleaseKernel(K_ctrl);
+	for (int j = 0; j < MLP_NMV; ++j) clReleaseKernel(K_mover[j]);
+	clReleaseKernel(K_collect);
 	clReleaseProgram(Program);
 	clReleaseCommandQueue(Command_Queue);
 	clReleaseContext(Context);
@@ -763,11 +886,12 @@ int main(int argc, char* argv[])
 	delete[] Device_IDs;
 	delete[] Mem_op_event;
 	delete[] K_exe_event;
-	for (int c = 0; c < NB_CASES; ++c) { delete[] gold_y[c]; delete[] hw_y[c]; }
-	delete[] gold_y;  delete[] hw_y;  delete[] cov;
+	for (int c = 0; c < NB_CASES; ++c) { delete[] gold_y[c]; delete[] hw_y[c]; delete[] ref_y[c]; }
+	delete[] gold_y;  delete[] hw_y;  delete[] ref_y;  delete[] cov;
+	mlp_free_layer(&layer);
 	for (int p = 0; p < MLP_NPC; ++p) free(ch_img[p]);
 	free(x_q); free(r_g); free(r_u);
-	free(c_down); free(ln_gamma); free(resid); free(RES);
+	free(c_down); free(RES);
 
 	cout << endl << "HOST-Info: DONE" << endl << endl;
 
