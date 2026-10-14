@@ -54,6 +54,7 @@ call_xxx() 的 pattern 各自新增一個 wrapper 即可）：
        未被官方量化，S_target 待團隊決策，見文件 v2.0 第7節第3項）
 """
 
+import math
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
@@ -215,6 +216,7 @@ def fast_inv_unit_python(x: np.ndarray, mode_recip: bool = False,
                           dt_width: int = FASTINV_DT_WIDTH,
                           dt_frac: int = FASTINV_DT_FRAC,
                           rt_frac: int = FASTINV_RT_FRAC,
+                          rt_int_bits: int = 12,
                           magic_recip: int = FASTINV_MAGIC_RECIP,
                           magic_rsqrt: int = FASTINV_MAGIC_RSQRT) -> np.ndarray:
     """
@@ -238,6 +240,10 @@ def fast_inv_unit_python(x: np.ndarray, mode_recip: bool = False,
         mode_recip  : False=rsqrt模式（RMSNorm用這個），True=reciprocal模式
         dt_width/dt_frac : DT（輸入x）的ap_fixed位元寬度/小數位元數
         rt_frac     : RT（輸出y）的小數位元數
+        rt_int_bits : RT（輸出y）的整數位元數（kernel.h: rsq_t =
+                      ap_ufixed<32,12>，沒有宣告AP_RND，Q模式預設是
+                      AP_TRN截斷，O模式預設AP_WRAP環繞——跟quantize_
+                      ufixed()用的round+飽和不同，見下方quantize_rt_trunc）
         magic_recip/magic_rsqrt : 兩個magic constant，待kernel.h補上
 
     回傳：
@@ -250,6 +256,22 @@ def fast_inv_unit_python(x: np.ndarray, mode_recip: bool = False,
 
     W = dt_width
     F = dt_frac
+
+    def quantize_ufixed(v, frac, int_bits):
+        scaled = round(v * (1 << frac))
+        qmax = (1 << (int_bits + frac)) - 1
+        scaled = max(0, min(scaled, qmax))  # ap_ufixed飽和/截斷（無號）
+        return scaled / float(1 << frac)
+
+    def quantize_rt_trunc(v, frac, int_bits):
+        """對應rsq_t = ap_ufixed<32,12>（沒有宣告AP_RND，Q模式預設
+        AP_TRN截斷、O模式預設AP_WRAP環繞）——跟quantize_ufixed()
+        的差別只在這裡用math.floor而不是round，而且溢位是環繞
+        不是飽和clip，因為rsq_t本身沒有AP_SAT。"""
+        scaled = math.floor(v * (1 << frac))
+        qmax = (1 << (int_bits + frac)) - 1
+        scaled = scaled & qmax  # AP_WRAP：超出範圍時環繞
+        return scaled / float(1 << frac)
 
     for idx, xv in enumerate(x_flat):
         # ---- 把x轉成W-bit定點整數表示（模擬ap_fixed<W, W-F>的bit pattern）----
@@ -293,10 +315,12 @@ def fast_inv_unit_python(x: np.ndarray, mode_recip: bool = False,
         # yb的基準是2^-31（bit31代表2^0），換算成RT的Q-format（rt_frac位小數）
         y = y0_scaled / (1 << (31 + (31 - rt_frac)))
         # 上一行對齊：yb_int本身以2^-31為單位，y0_scaled同理；
-        # 除以2^31拿到「真實浮點值」，再乘上2^rt_frac、取整、除回，
-        # 等效於量化到rt_frac小數位元，這裡直接留實數，Newton-Raphson
-        # 在golden model階段一樣用float64算，不逐位元模擬中間舍入
-        y = y0_scaled / float(1 << 31)
+        # 除以2^31拿到「真實浮點值」
+        # ⚠️ 2026-10-13修正：C++第109行 y = (RT)(yb << e_y 或 >> -e_y) 這個
+        # cast本身就是把寬精度結果截斷進rsq_t的20-bit frac（RT沒有
+        # AP_RND，Q模式預設AP_TRN），seed這一步不能留全精度float，要
+        # 立刻做一次quantize_rt_trunc，否則跟C++從第一步就不一致
+        y = quantize_rt_trunc(y0_scaled / float(1 << 31), rt_frac, rt_int_bits)
 
         # ---- 4) 兩次Newton-Raphson ----
         # ⚠️ 2026-09-20 c-simulation發現：原本這裡整段用float64算，
@@ -315,12 +339,6 @@ def fast_inv_unit_python(x: np.ndarray, mode_recip: bool = False,
         XY_FRAC = 32 - 18  # ap_ufixed<32,18,AP_RND>
         T_FRAC = 26 - 2    # ap_ufixed<26,2,AP_RND>
 
-        def quantize_ufixed(v, frac, int_bits):
-            scaled = round(v * (1 << frac))
-            qmax = (1 << (int_bits + frac)) - 1
-            scaled = max(0, min(scaled, qmax))  # ap_ufixed飽和/截斷（無號）
-            return scaled / float(1 << frac)
-
         x_real = x_int / float(1 << F)
         for _ in range(2):
             xy = quantize_ufixed(x_real * y, XY_FRAC, 18)
@@ -328,11 +346,10 @@ def fast_inv_unit_python(x: np.ndarray, mode_recip: bool = False,
                 t = quantize_ufixed(2.0 - xy, T_FRAC, 2)
             else:
                 t = quantize_ufixed(1.5 - 0.5 * xy * y, T_FRAC, 2)
-            # C++: y = (RT)(y * t)——每次迭代後都捨入回RT(rt_frac)，
-            # 不是只有最後回傳時才捨入，這裡跟著補上，否則第二次
-            # 迭代用的y就不是C++實際會用的那個已捨入值
-            y_raw = round(y * t * (1 << rt_frac))
-            y = y_raw / float(1 << rt_frac)
+            # C++: y = (RT)(y * t)——rsq_t沒有AP_RND，這個cast是截斷，
+            # 不是四捨五入，round()在這裡跟C++實際硬體行為不一致
+            # （2026-10-13修正：round改成quantize_rt_trunc）
+            y = quantize_rt_trunc(y * t, rt_frac, rt_int_bits)
 
         y_flat[idx] = y
 
