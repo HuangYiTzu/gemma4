@@ -1,0 +1,14 @@
+sliding_q_small 256 128 10 10 32 8 sliding
+sliding_q_full 256 128 10 10 32 8 sliding
+sliding_q_edge 256 128 10 10 32 8 sliding
+sliding_k_small 256 128 14 14 32 1 sliding
+sliding_k_full 256 128 14 14 32 1 sliding
+sliding_k_edge 256 128 14 14 32 1 sliding
+global_q_small 512 64 10 10 32 8 global
+global_q_full 512 64 10 10 32 8 global
+global_q_edge 512 64 10 10 32 8 global
+global_k_small 512 64 14 14 32 1 global
+global_k_full 512 64 14 14 32 1 global
+global_k_edge 512 64 14 14 32 1 global
+sliding_q_12to10 256 128 12 10 32 8 sliding
+global_q_12to10 512 64 12 10 32 8 global
